@@ -6,7 +6,6 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANO
 const genAI    = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const resend   = new Resend(process.env.RESEND_API_KEY);
 
-// ─── FIRECRAWL ──────────────────────────────────────────────────────────────
 async function scrapeAmazon(url, country, lang) {
   const res = await fetch('https://api.firecrawl.dev/v1/scrape', {
     method: 'POST',
@@ -23,20 +22,19 @@ async function scrapeAmazon(url, country, lang) {
       location: { country, languages: [lang] },
       actions: [
         { type: 'wait', milliseconds: 2000 },
-        { type: 'screenshot', fullPage: false },    // [0] main image area
+        { type: 'screenshot', fullPage: false },
         { type: 'scroll', y: 700 },
         { type: 'wait', milliseconds: 1000 },
-        { type: 'screenshot', fullPage: false },    // [1] gallery area
+        { type: 'screenshot', fullPage: false },
         { type: 'scroll', y: 2500 },
         { type: 'wait', milliseconds: 1200 },
-        { type: 'screenshot', fullPage: false }     // [2] A+ content area
+        { type: 'screenshot', fullPage: false }
       ]
     })
   });
   return res.json();
 }
 
-// ─── GEMINI EXTRACTION ──────────────────────────────────────────────────────
 async function extractSnapshot(markdownText) {
   const model  = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
   const prompt = `
@@ -61,12 +59,11 @@ Use null for any missing field. Return ONLY the JSON with no markdown fences.
 PAGE TEXT:
 ${markdownText.slice(0, 14000)}
 `;
-  const result   = await model.generateContent(prompt);
-  const rawText  = result.response.text().trim().replace(/```json|```/g, '').trim();
+  const result  = await model.generateContent(prompt);
+  const rawText = result.response.text().trim().replace(/```json|```/g, '').trim();
   return JSON.parse(rawText);
 }
 
-// ─── CHANGE DETECTION ───────────────────────────────────────────────────────
 function detectChanges(old, nw, threshold) {
   const changes = [];
   if (!old) { changes.push('🆕 First snapshot captured'); return changes; }
@@ -89,17 +86,14 @@ function detectChanges(old, nw, threshold) {
   return changes;
 }
 
-// ─── EMAIL BUILDER ──────────────────────────────────────────────────────────
 function buildEmail(snap, changes, asin, marketplace, shots) {
   const url = `https://www.${marketplace}/dp/${asin}`;
-  const changesHtml = changes.map(c => `<li style="margin:0 0 8px;font-weight:600">${c}</li>`).join('');
-  const bulletsHtml = (snap.bullets||[]).map(b => `<li style="margin:0 0 6px;color:#555">${b}</li>`).join('');
-
-  // Screenshot blocks — only include if the screenshot URL exists
-  const shotLabels = ['Main image area', 'Gallery area', 'A+ content area'];
+  const changesHtml  = changes.map(c => `<li style="margin:0 0 8px;font-weight:600">${c}</li>`).join('');
+  const bulletsHtml  = (snap.bullets||[]).map(b => `<li style="margin:0 0 6px;color:#555">${b}</li>`).join('');
+  const shotLabels   = ['Main image area', 'Gallery area', 'A+ content area'];
   const screenshotBlocks = (shots||[]).filter(s=>!!s).map((src, i) => `
     <div style="margin:0 0 16px">
-      <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#999;margin:0 0 6px">Screenshot: ${shotLabels[i] || 'Page area'}</div>
+      <div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:#999;margin:0 0 6px">${shotLabels[i]||'Screenshot'}</div>
       <img src="${src}" alt="${shotLabels[i]||'screenshot'}" width="520"
            style="max-width:100%;border:1px solid #e5e5e5;border-radius:8px;display:block" />
     </div>`).join('');
@@ -129,17 +123,13 @@ function buildEmail(snap, changes, asin, marketplace, shots) {
   </div>`;
 }
 
-// ─── MAIN HANDLER ────────────────────────────────────────────────────────────
 export async function GET(req) {
-
-  // Protect the endpoint — only Vercel cron (or you) can trigger it
-  const secret = req.headers.get('authorization') || req.nextUrl?.searchParams?.get('secret');
+  const secret = req.headers.get('authorization') || new URL(req.url).searchParams.get('secret');
   if (process.env.CRON_SECRET && secret !== `Bearer ${process.env.CRON_SECRET}` && secret !== process.env.CRON_SECRET) {
     return Response.json({ error: 'Unauthorised' }, { status: 401 });
   }
 
-  // Load all active watches from Supabase
-  const { data: watches, error } = await supabase
+  const {  watches, error } = await supabase
     .from('watches')
     .select('*')
     .eq('active', true);
@@ -150,34 +140,26 @@ export async function GET(req) {
 
   for (const watch of watches) {
     try {
-      const url = `https://www.${watch.marketplace}/dp/${watch.asin}`;
-
-      // 1. Scrape
+      const url      = `https://www.${watch.marketplace}/dp/${watch.asin}`;
       const fcData   = await scrapeAmazon(url, watch.marketplace_country, watch.marketplace_lang);
       const markdown = fcData?.data?.markdown || '';
       const shots    = fcData?.data?.actions?.screenshots || [];
       const images   = fcData?.data?.images || [];
 
-      // 2. Extract
       const snapshot = await extractSnapshot(markdown);
-      snapshot.main_image_url = images[0] || null;
-      snapshot.main_image_screenshot = shots[0] || null;
-      snapshot.gallery_screenshot    = shots[1] || null;
-      snapshot.aplus_screenshot      = shots[2] || null;
-      snapshot.captured_at           = new Date().toISOString();
+      snapshot.main_image_url          = images[0] || null;
+      snapshot.main_image_screenshot   = shots[0]  || null;
+      snapshot.gallery_screenshot      = shots[1]  || null;
+      snapshot.aplus_screenshot        = shots[2]  || null;
+      snapshot.captured_at             = new Date().toISOString();
 
-      // 3. Diff
-      const oldSnap  = watch.last_snapshot;
-      const changes  = detectChanges(oldSnap, snapshot, watch.price_threshold || 0);
-      const changed  = changes.length > 0;
+      const oldSnap = watch.last_snapshot;
+      const changes = detectChanges(oldSnap, snapshot, watch.price_threshold || 0);
+      const changed = changes.length > 0;
 
-      // 4. Email
       if (changed) {
         const emailHtml = buildEmail(
-          snapshot,
-          changes,
-          watch.asin,
-          watch.marketplace,
+          snapshot, changes, watch.asin, watch.marketplace,
           [snapshot.main_image_screenshot, snapshot.gallery_screenshot, snapshot.aplus_screenshot]
         );
         await resend.emails.send({
@@ -188,15 +170,11 @@ export async function GET(req) {
         });
       }
 
-      // 5. Persist snapshot
-      await supabase
-        .from('watches')
-        .update({
-          last_snapshot:   snapshot,
-          last_alerted_at: changed ? new Date().toISOString() : watch.last_alerted_at,
-          updated_at:      new Date().toISOString()
-        })
-        .eq('id', watch.id);
+      await supabase.from('watches').update({
+        last_snapshot:   snapshot,
+        last_alerted_at: changed ? new Date().toISOString() : watch.last_alerted_at,
+        updated_at:      new Date().toISOString()
+      }).eq('id', watch.id);
 
       results.push({ asin: watch.asin, changes, alerted: changed });
 
